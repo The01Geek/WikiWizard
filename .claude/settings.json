@@ -6,6 +6,10 @@
         "hooks": [
           {
             "type": "command",
+            "command": "for f in \"$CLAUDE_EDITED_FILES\"; do case \"$f\" in *.yml|*.yaml) python3 -c \"import yaml,sys; yaml.safe_load(open(sys.argv[1]))\" \"$f\" && echo \"✓ $f\" || echo \"✗ YAML error in $f\";; esac; done"
+          },
+          {
+            "type": "command",
             "command": "cd /home/natprog/guidoo/client && npx tsc --noEmit 2>&1 | head -20 || true"
           }
         ]
