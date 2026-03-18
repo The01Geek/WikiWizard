@@ -1,0 +1,174 @@
+name: WikiWizard
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize, labeled, unlabeled]
+
+concurrency:
+  group: claude-docs-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  documentation:
+    # Run when "Documented" label is not yet present and PR is not in draft mode
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'Documented') &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read internal documentation prompt
+        id: read-internal-prompt
+        run: |
+          PROMPT=$(cat .github/workflows/prompts/wikiwizard-internal.action.prompt.md)
+          PROMPT="${PROMPT//\[\[INTERNAL_DOC_LOCATION\]\]/docs/internal/}"
+          echo "PROMPT<<PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$PROMPT" >> $GITHUB_OUTPUT
+          echo "PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+
+      - name: Run Internal Documentation Review
+        id: claude-internal
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.read-internal-prompt.outputs.PROMPT }}
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --allowed-tools
+            "Read,
+            Write,
+            Glob,
+            Grep,
+            Bash(git status:*),
+            Bash(git diff:*),
+            Bash(gh pr comment:*),
+            Bash(gh pr diff:*),
+            Bash(gh pr view:*),
+            Bash(gh pr review:*)"
+
+      - name: Read external documentation prompt
+        id: read-external-prompt
+        run: |
+          PROMPT=$(cat .github/workflows/prompts/wikiwizard-external.action.prompt.md)
+          PROMPT="${PROMPT//\[\[EXTERNAL_DOC_LOCATION\]\]/docs/external/}"
+          echo "PROMPT<<PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$PROMPT" >> $GITHUB_OUTPUT
+          echo "PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+
+      - name: Run External Documentation Review
+        id: claude-external
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.read-external-prompt.outputs.PROMPT }}
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --allowed-tools
+            "Read,
+            Write,
+            Glob,
+            Grep,
+            Bash(git status:*),
+            Bash(git diff:*),
+            Bash(gh pr comment:*),
+            Bash(gh pr diff:*),
+            Bash(gh pr view:*),
+            Bash(gh pr review:*)"
+
+      - name: Read release notes prompt
+        id: read-release-prompt
+        run: |
+          PROMPT=$(cat .github/workflows/prompts/wikiwizard-release-notes.action.prompt.md)
+          PROMPT="${PROMPT//\[\[PR_NUMBER\]\]/${{ github.event.pull_request.number }}}"
+          echo "PROMPT<<PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$PROMPT" >> $GITHUB_OUTPUT
+          echo "PROMPT_CONTENT_EOF" >> $GITHUB_OUTPUT
+
+      - name: Run Release Notes Review
+        id: claude-release-notes
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.read-release-prompt.outputs.PROMPT }}
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --allowed-tools
+            "Read,
+            Write,
+            Glob,
+            Grep,
+            Bash(git status:*),
+            Bash(git diff:*),
+            Bash(gh pr view:*)"
+
+      - name: Commit and push all documentation changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git add docs/internal/ docs/external/ docs/external/release-notes.md
+          if git diff --cached --quiet; then
+            echo "No documentation changes to commit"
+          else
+            git commit -m "docs: update documentation [skip ci]"
+            git push origin "HEAD:refs/heads/${{ github.event.pull_request.head.ref }}"
+          fi
+
+      - name: Add Documented Label
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['Documented']
+            });
+
+  request-claude-review:
+    needs: documentation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RADMAN_AI_APP_ID }}
+          private-key: ${{ secrets.RADMAN_AI_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          ORG="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          echo "💬 Posting review request on PR #$PR_NUMBER..."
+          gh pr comment "$PR_NUMBER" \
+            --repo "$ORG/$REPO_NAME" \
+            --body "@claude run /pr-review-toolkit:review-pr"
+          echo "✅ Review comment posted on PR #$PR_NUMBER"
+
+          echo "## ✅ Claude Review Requested" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PR:** [#${PR_NUMBER}](https://github.com/${ORG}/${REPO_NAME}/pull/${PR_NUMBER})" >> "$GITHUB_STEP_SUMMARY"
